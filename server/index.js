@@ -6,15 +6,20 @@ const express = require('express');
 const session = require('express-session');
 const path = require('node:path');
 
-const db = require('./database');
-const SQLiteSessionStore = require('./sqliteSessionStore');
-const { authenticateAdmin } = require('./auth');
+const { db, initializeDatabase } = require('./database.pg');
+const PostgresSessionStore = require('./postgresSessionStore');
+const {
+  authenticateAdmin,
+  findAdminById
+} = require('./auth');
+
 const {
   securityHeaders,
   generalLimiter,
   loginLimiter,
   formLimiter
 } = require('./middleware/security');
+
 const {
   generateToken,
   csrfProtection,
@@ -39,7 +44,7 @@ app.use(express.urlencoded({ extended: false, limit: '20kb' }));
 app.use(session({
   name: 'pmcb.sid',
   secret: process.env.SESSION_SECRET,
-  store: new SQLiteSessionStore(db),
+  store: new PostgresSessionStore(db),
   resave: false,
   saveUninitialized: false,
   rolling: true,
@@ -118,27 +123,30 @@ app.post('/api/admin/login', loginLimiter, async (req, res, next) => {
   }
 });
 
-app.get('/api/admin/me', (req, res) => {
-  if (!req.session.adminId) {
-    return res.status(401).json({
-      success: false,
-      message: 'Não autenticado.'
-    });
-  }
-
-  const { findAdminById } = require('./auth');
-  const admin = findAdminById(req.session.adminId);
-
-  if (!admin) {
-    return req.session.destroy(() => {
-      res.status(401).json({
+app.get('/api/admin/me', async (req, res, next) => {
+  try {
+    if (!req.session.adminId) {
+      return res.status(401).json({
         success: false,
-        message: 'Sessão inválida.'
+        message: 'Não autenticado.'
       });
-    });
-  }
+    }
 
-  res.json({ success: true, admin });
+    const admin = await findAdminById(req.session.adminId);
+
+    if (!admin) {
+      return req.session.destroy(() => {
+        res.status(401).json({
+          success: false,
+          message: 'Sessão inválida.'
+        });
+      });
+    }
+
+    res.json({ success: true, admin });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/admin/logout', (req, res) => {
@@ -164,28 +172,33 @@ app.post('/api/admin/logout', (req, res) => {
   });
 });
 
-
 function readFormText(value, maxLength, required = false) {
   if (typeof value !== 'string') return required ? null : '';
+
   const text = value.trim();
+
   if (required && !text) return null;
   if (text.length > maxLength) return null;
+
   return text;
 }
 
 function validEmail(value) {
   return typeof value === 'string' &&
     value.length <= 254 &&
-    /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(value.trim());
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
 }
 
 function hasPrivacyConsent(value) {
-  return value === true || value === 'true' ||
-    value === '1' || value === 'on';
+  return value === true ||
+    value === 'true' ||
+    value === '1' ||
+    value === 'on';
 }
 
-app.post('/api/applications/supporter', formLimiter, (req, res) => {
+app.post('/api/applications/supporter', formLimiter, async (req, res) => {
   const body = req.body || {};
+
   const name = readFormText(body.name, 120, true);
   const email = body.email;
   const phone = readFormText(body.phone, 30);
@@ -193,9 +206,15 @@ app.post('/api/applications/supporter', formLimiter, (req, res) => {
   const city = readFormText(body.city, 100);
   const interests = readFormText(body.interests, 1000);
 
-  if (!name || !validEmail(email) || phone === null ||
-      state === null || city === null || interests === null ||
-      !hasPrivacyConsent(body.privacy_consent)) {
+  if (
+    !name ||
+    !validEmail(email) ||
+    phone === null ||
+    state === null ||
+    city === null ||
+    interests === null ||
+    !hasPrivacyConsent(body.privacy_consent)
+  ) {
     return res.status(400).json({
       success: false,
       message: 'Confira os campos e autorize o tratamento dos dados.'
@@ -203,18 +222,29 @@ app.post('/api/applications/supporter', formLimiter, (req, res) => {
   }
 
   try {
-    const result = db.prepare(`
-      INSERT INTO supporter_applications
-      (name, email, phone, state, city, interests, privacy_consent)
-      VALUES (?, ?, ?, ?, ?, ?, 1)
-    `).run(name, email.trim().toLowerCase(), phone, state, city, interests);
+    const result = await db.query(
+      `INSERT INTO supporter_applications
+        (name, email, phone, state, city, interests, privacy_consent)
+       VALUES ($1, $2, $3, $4, $5, $6, 1)
+       RETURNING id`,
+      [
+        name,
+        email.trim().toLowerCase(),
+        phone,
+        state,
+        city,
+        interests
+      ]
+    );
 
     return res.status(201).json({
       success: true,
       message: 'Interesse registrado para análise.',
-      applicationId: Number(result.lastInsertRowid)
+      applicationId: Number(result.rows[0].id)
     });
   } catch (error) {
+    console.error('Erro ao registrar apoiador:', error.message);
+
     return res.status(500).json({
       success: false,
       message: 'Não foi possível registrar o interesse.'
@@ -222,8 +252,9 @@ app.post('/api/applications/supporter', formLimiter, (req, res) => {
   }
 });
 
-app.post('/api/applications/representative', formLimiter, (req, res) => {
+app.post('/api/applications/representative', formLimiter, async (req, res) => {
   const body = req.body || {};
+
   const name = readFormText(body.name, 120, true);
   const email = body.email;
   const phone = readFormText(body.phone, 30);
@@ -232,9 +263,16 @@ app.post('/api/applications/representative', formLimiter, (req, res) => {
   const desiredPosition = readFormText(body.desired_position, 120);
   const experience = readFormText(body.experience, 1500);
 
-  if (!name || !validEmail(email) || phone === null ||
-      !state || city === null || desiredPosition === null ||
-      experience === null || !hasPrivacyConsent(body.privacy_consent)) {
+  if (
+    !name ||
+    !validEmail(email) ||
+    phone === null ||
+    !state ||
+    city === null ||
+    desiredPosition === null ||
+    experience === null ||
+    !hasPrivacyConsent(body.privacy_consent)
+  ) {
     return res.status(400).json({
       success: false,
       message: 'Confira os campos e autorize o tratamento dos dados.'
@@ -242,21 +280,31 @@ app.post('/api/applications/representative', formLimiter, (req, res) => {
   }
 
   try {
-    const result = db.prepare(`
-      INSERT INTO representative_applications
-      (name, email, phone, state, city, desired_position, experience, privacy_consent)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(
-      name, email.trim().toLowerCase(), phone, state, city,
-      desiredPosition, experience
+    const result = await db.query(
+      `INSERT INTO representative_applications
+        (name, email, phone, state, city, desired_position,
+         experience, privacy_consent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+       RETURNING id`,
+      [
+        name,
+        email.trim().toLowerCase(),
+        phone,
+        state,
+        city,
+        desiredPosition,
+        experience
+      ]
     );
 
     return res.status(201).json({
       success: true,
       message: 'Interesse registrado para análise. Não representa nomeação oficial.',
-      applicationId: Number(result.lastInsertRowid)
+      applicationId: Number(result.rows[0].id)
     });
   } catch (error) {
+    console.error('Erro ao registrar representante:', error.message);
+
     return res.status(500).json({
       success: false,
       message: 'Não foi possível registrar o interesse.'
@@ -277,7 +325,10 @@ app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
 
   if (error === invalidCsrfTokenError) {
-    return res.status(403).json({ success: false, message: "Token CSRF inválido ou ausente." });
+    return res.status(403).json({
+      success: false,
+      message: 'Token CSRF inválido ou ausente.'
+    });
   }
 
   console.error('Erro interno:', error.message);
@@ -291,9 +342,16 @@ app.use((error, req, res, next) => {
 const PORT = Number(process.env.PORT) || 3000;
 
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('Portal PMCB iniciado na porta ' + PORT);
-  });
+  initializeDatabase()
+    .then(() => {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log('Portal PMCB iniciado na porta ' + PORT);
+      });
+    })
+    .catch((error) => {
+      console.error('Falha ao inicializar o banco:', error.message);
+      process.exit(1);
+    });
 }
 
 module.exports = app;

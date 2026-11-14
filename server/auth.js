@@ -1,5 +1,5 @@
 const bcrypt = require('bcryptjs');
-const db = require('./database');
+const { db } = require('./database.pg');
 
 const SALT_ROUNDS = 12;
 
@@ -36,37 +36,53 @@ function normalizeEmail(email) {
   return normalized;
 }
 
-async function createAdmin({ name, email, password, role = 'editor' }) {
+async function createAdmin({
+  name,
+  email,
+  password,
+  role = 'editor'
+}) {
   if (typeof name !== 'string' || name.trim().length < 2) {
     throw new Error('Nome inválido.');
   }
 
   if (!['superadmin', 'admin', 'editor'].includes(role)) {
-    throw new Error('Função administrativa inválida.');
+    throw new Error('Função inválida.');
   }
 
   const normalizedEmail = normalizeEmail(email);
   const passwordHash = await hashPassword(password);
 
-  const result = db.prepare(`
-    INSERT INTO admin_users (name, email, password_hash, role)
-    VALUES (?, ?, ?, ?)
-  `).run(name.trim(), normalizedEmail, passwordHash, role);
+  const result = await db.query(
+    `INSERT INTO admin_users (name, email, password_hash, role)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id`,
+    [name.trim(), normalizedEmail, passwordHash, role]
+  );
 
-  return Number(result.lastInsertRowid);
+  return Number(result.rows[0].id);
 }
 
 async function authenticateAdmin(email, password) {
-  const normalizedEmail = normalizeEmail(email);
+  let normalizedEmail;
 
-  const user = db.prepare(`
-    SELECT id, name, email, password_hash, role, active
-    FROM admin_users
-    WHERE email = ?
-    LIMIT 1
-  `).get(normalizedEmail);
+  try {
+    normalizedEmail = normalizeEmail(email);
+  } catch {
+    return null;
+  }
 
-  if (!user || user.active !== 1) {
+  const result = await db.query(
+    `SELECT id, name, email, password_hash, role, active
+     FROM admin_users
+     WHERE email = $1
+     LIMIT 1`,
+    [normalizedEmail]
+  );
+
+  const user = result.rows[0];
+
+  if (!user || Number(user.active) !== 1) {
     return null;
   }
 
@@ -80,27 +96,30 @@ async function authenticateAdmin(email, password) {
   }
 
   return {
-    id: user.id,
+    id: Number(user.id),
     name: user.name,
     email: user.email,
     role: user.role
   };
 }
 
-function findAdminById(id) {
-  const user = db.prepare(`
-    SELECT id, name, email, role, active
-    FROM admin_users
-    WHERE id = ?
-    LIMIT 1
-  `).get(id);
+async function findAdminById(id) {
+  const result = await db.query(
+    `SELECT id, name, email, role, active
+     FROM admin_users
+     WHERE id = $1
+     LIMIT 1`,
+    [id]
+  );
 
-  if (!user || user.active !== 1) {
+  const user = result.rows[0];
+
+  if (!user || Number(user.active) !== 1) {
     return null;
   }
 
   return {
-    id: user.id,
+    id: Number(user.id),
     name: user.name,
     email: user.email,
     role: user.role

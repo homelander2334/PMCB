@@ -1,6 +1,6 @@
 const readline = require('node:readline/promises');
 const { stdin, stdout } = require('node:process');
-const db = require('../server/database');
+const { db } = require('../server/database.pg');
 const { createAdmin } = require('../server/auth');
 
 async function readHidden(prompt) {
@@ -43,22 +43,36 @@ async function readHidden(prompt) {
 }
 
 async function main() {
-  const total = db.prepare(
-    'SELECT COUNT(*) AS total FROM admin_users'
-  ).get().total;
-
-  if (total > 0) {
-    throw new Error('Já existe um administrador. Cadastro inicial bloqueado.');
-  }
-
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-
   try {
-    const name = await rl.question('Nome do superadministrador: ');
-    const email = await rl.question('E-mail administrativo: ');
-    rl.close();
+    const resultado = await db.query(
+      'SELECT COUNT(*)::int AS total FROM admin_users'
+    );
 
-    const password = await readHidden('Senha (mínimo 12 caracteres): ');
+    if (resultado.rows[0].total > 0) {
+      throw new Error(
+        'Já existe um administrador. Cadastro inicial bloqueado.'
+      );
+    }
+
+    const rl = readline.createInterface({
+      input: stdin,
+      output: stdout
+    });
+
+    let name;
+    let email;
+
+    try {
+      name = await rl.question('Nome do superadministrador: ');
+      email = await rl.question('E-mail administrativo: ');
+    } finally {
+      rl.close();
+    }
+
+    const password = await readHidden(
+      'Senha (mínimo 12 caracteres): '
+    );
+
     const confirmation = await readHidden('Confirme a senha: ');
 
     if (password !== confirmation) {
@@ -75,7 +89,7 @@ async function main() {
     console.log('Superadministrador criado com sucesso. ID:', id);
     console.log('Guarde suas credenciais em local seguro.');
   } finally {
-    if (!rl.closed) rl.close();
+    await db.end();
   }
 }
 
